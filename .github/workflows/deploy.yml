@@ -1,0 +1,74 @@
+name: Deploy to EC2 (Docker run)
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: aws-keys  # uses your Environment (vars + secrets)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ROLE_ARN }}   # <-- SECRET
+          aws-region: ${{ vars.AWS_REGION }}        # <-- VAR
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPO: ${{ vars.ECR_REPOSITORY }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$REPO:$TAG .
+          docker tag  $REGISTRY/$REPO:$TAG $REGISTRY/$REPO:latest
+          docker push $REGISTRY/$REPO:$TAG
+          docker push $REGISTRY/$REPO:latest
+
+      - name: SSH to EC2 and deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.EC2_HOST }}
+          username: ${{ vars.EC2_USER }}
+          key: ${{ vars.EC2_SSH_KEY }}           # <-- SECRET
+          script: |
+            set -euo pipefail
+            REGION=${{ vars.AWS_REGION }}
+            ACCOUNT=${{ vars.AWS_ECR_ACCOUNT }}
+            REPO=${{ vars.ECR_REPOSITORY }}
+            IMAGE="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO:latest"
+
+            # ensure docker is running
+            sudo systemctl start docker
+
+            # ECR login (note sudo on docker)
+            aws ecr get-login-password --region "$REGION" \
+              | sudo docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+
+            sudo mkdir -p /srv/app
+            # create a default env file if it doesn't exist
+            sudo bash -lc '[[ -f /srv/app/.env ]] || echo -e "NODE_ENV=production\nPORT=3000" > /srv/app/.env'
+
+            sudo docker pull "$IMAGE"
+            sudo docker rm -f "$REPO" || true
+            sudo docker run -d --name "$REPO" \
+              --restart unless-stopped \
+              --env-file /srv/app/.env \
+              -p 80:3000 \
+              "$IMAGE"
+
+            sudo docker image prune -f
